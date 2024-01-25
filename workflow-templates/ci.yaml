@@ -1,0 +1,58 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+
+    # Setup and Test for Python
+    - name: Set up Python
+      uses: actions/setup-python@v2
+      with:
+        python-version: '3.x'
+    - name: Install Python dependencies and run tests
+      run: |
+        pip install -r requirements.txt
+        pytest --cov=./ --cov-report=xml
+
+    # Setup and Test for JavaScript
+    - name: Set up Node
+      uses: actions/setup-node@v2
+      with:
+        node-version: '14'
+    - name: Install JavaScript dependencies and run tests
+      run: |
+        npm install
+        npm test -- --coverage
+
+    # Setup and Test for Ruby
+    - name: Set up Ruby
+      uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: '3.0' 
+    - name: Install Ruby dependencies and run tests
+      run: |
+        bundle install
+        bundle exec rake test # or your specific test command
+
+    # Setup and Test for PHP
+    - name: Set up PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: '7.4' 
+    - name: Install PHP dependencies and run tests
+      run: |
+        composer install
+        ./vendor/bin/phpunit --coverage-clover coverage.xml
+
+    # Upload coverage to Codecov
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v2
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }} # Not required for public repos
+        files: ./coverage.xml,./coverage/lcov.info,./path/to/ruby/coverage/report,./path/to/php/coverage.xml
+        fail_ci_if_error: true # Optional
