@@ -37,7 +37,7 @@ jobs:
             require "bundler"
             unless Bundler::Definition.build("Gemfile", nil, nil).dependencies.any? { |d| d.name == "aifinyo_utils" }
               puts "\e[31mError: aifinyo-utils gem is required but missing from Gemfile\e[0m"
-              puts "\e[31mAdd aifinyo-utils in the latest version to your Gemfile and run its installer!\e[0m"
+              puts "\e[31mAdd "gem 'aifinyo_utils', github: 'aifinyo-ag/aifinyo_utils'" to your Gemfile and run its installer!\e[0m"
               exit 1
             end
           '
