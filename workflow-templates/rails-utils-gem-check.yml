@@ -27,4 +27,4 @@ jobs:
           '
       - name: Check gem execution
         run: |
-          bundle exec aifinyo_utils:check_installation
+          bundle exec aifinyo_utils:check:install
