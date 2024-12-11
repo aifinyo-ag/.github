@@ -1,5 +1,6 @@
 name: Lint checks
-# description: This workflow runs security audits and linters on the codebase.
+# description: Org wide workflow to enforce aifinyo_utils gem installation and execution to ensure
+#   consistent code quality and app setup.
 
 on:
   - pull_request
@@ -7,6 +8,8 @@ on:
 
 jobs:
   check_gem_installation:
+    # only run on Rails projects
+    if: ${{ hashFiles('Gemfile') != '' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
