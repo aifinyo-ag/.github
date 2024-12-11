@@ -1,4 +1,4 @@
-name: Lint checks
+name: Aifinyo Utils Gem Check
 # description: Org wide workflow to enforce aifinyo_utils gem installation and execution to ensure
 #   consistent code quality and app setup.
 
