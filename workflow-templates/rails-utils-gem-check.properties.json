@@ -1,0 +1,10 @@
+{
+  "name": "Rails Linter Workflow",
+  "description": "Rails linter workflow template.",
+  "iconName": "ruby",
+  "categories": ["Ruby", "Rails"],
+  "filePatterns": [
+    "Gemfile$",
+    "config/application.rb$"
+  ]
+}

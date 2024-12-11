@@ -1,0 +1,30 @@
+name: Lint checks
+# description: This workflow runs security audits and linters on the codebase.
+
+on:
+  - pull_request
+  - workflow_dispatch
+
+jobs:
+  check_gem_installation:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Install Ruby and gems
+        uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+      - name: Check gem installation
+        run: |
+          ruby -e '
+            require "bundler"
+            unless Bundler::Definition.build("Gemfile", nil, nil).dependencies.any? { |d| d.name == "aifinyo-utils" }
+              puts "\e[31mError: aifinyo-utils gem is required but missing from Gemfile\e[0m"
+              puts "\e[31mAdd aifinyo-utils in the latest version to your Gemfile and run its installer!\e[0m"
+              exit 1
+            end
+          '
+      - name: Check gem execution
+        run: |
+          bundle exec aifinyo_utils:check_installation

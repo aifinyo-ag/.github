@@ -1,0 +1,124 @@
+name: Lint checks
+# description: This workflow runs security audits and linters on the codebase.
+
+on:
+  - pull_request
+  - workflow_dispatch
+
+jobs:
+  bundle_audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Install Ruby and gems
+        uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+      # Add or replace any other lints here
+      - name: Security audit dependencies
+        if: ${{ always() }}
+        run: |
+          bundle exec bundler-audit --update --output log/bundler-audit.log
+          cat log/bundler-audit.log
+      - name: Print bundler audit output
+        if: ${{ failure() }}
+        run: cat log/bundler-audit.log
+      - name: Store artifacts
+        uses: actions/upload-artifact@v4
+        if: ${{ failure() }}
+        with:
+          name: bundle-audit-results
+          path: |
+            log/*.*
+
+  brakeman:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Install Ruby and gems
+        uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+      - name: Security audit application code
+        if: ${{ always() }}
+        # -w3 only reports highest confidence - see Confidence Levels on https://brakemanscanner.org/docs/options/
+        run: |
+          bundle exec brakeman -q -w3 -o log/brakeman.html -o log/brakeman.log
+      - name: Print Brakeman output
+        if: ${{ failure() }}
+        run: cat log/brakeman.log
+      - name: Store artifacts
+        uses: actions/upload-artifact@v4
+        if: ${{ failure() }}
+        with:
+          name: brakeman-results
+          path: |
+            log/*.*
+
+  rubocop:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Ruby and gems
+        uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+      - name: Lint Ruby files
+        if: ${{ always() }}
+        # Get the list of changed files and check them with rubocop
+        run: |
+          git diff --name-only --diff-filter=MA origin/${{ github.base_ref }} ${{ github.event.pull_request.head.sha }} |
+          xargs bundle exec rubocop --require rubocop-rails --require rubocop-performance --force-exclusion --format html -o log/rubocop.html --format simple -o log/rubocop.log
+      - name: Print Rubocop output
+        if: ${{ failure() }}
+        run: cat log/rubocop.log
+      - name: Store artifacts
+        uses: actions/upload-artifact@v4
+        if: ${{ failure() }}
+        with:
+          name: rubocop-results
+          path: |
+            log/*.*
+
+  yaml_lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Ruby and gems
+        uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+      - name: Check for changed YAML files in PR
+        id: check-yaml
+        run: |
+          echo "YAML_FILES_CHANGED=$(git diff --name-only --diff-filter=MA origin/${{ github.base_ref }} ${{ github.event.pull_request.head.sha }} | grep '\.ya\?ml$' | wc -l)" >> $GITHUB_ENV
+      - name: Lint YAML files
+        if: ${{ env.YAML_FILES_CHANGED != 0 }}
+        # Get the list of changed .yml/.yaml files and check them with yaml-lint
+        run: |
+          git diff --name-only origin/${{ github.base_ref }} ${{ github.event.pull_request.head.sha }} |
+          grep '\.ya\?ml$' |
+          xargs bundle exec yaml-lint |
+          tee log/yaml-lint.log
+      - name: Check for offenses
+        id: check-yaml-offenses
+        run: |
+          echo "YAML_OFFENSES=$(test -s log/yaml-lint.log)" >> $GITHUB_ENV
+      - name: Report errors
+        if: ${{ env.YAML_OFFENSES != 0 }}
+        run: cat log/yaml-lint.log
+      - name: Store artifacts
+        uses: actions/upload-artifact@v4
+        if: ${{ env.YAML_OFFENSES == '0' }}
+        with:
+          name: yaml-lint-results
+          path: |
+            log/*.*
