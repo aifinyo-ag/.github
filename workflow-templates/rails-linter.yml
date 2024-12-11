@@ -15,7 +15,6 @@ jobs:
         uses: ruby/setup-ruby@v1
         with:
           bundler-cache: true
-      # Add or replace any other lints here
       - name: Security audit dependencies
         if: ${{ always() }}
         run: |
