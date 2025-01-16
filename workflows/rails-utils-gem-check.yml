@@ -1,0 +1,47 @@
+name: Aifinyo Utils Gem Check
+# description: Org wide workflow to enforce aifinyo_utils gem installation and execution to ensure
+#   consistent code quality and app setup.
+
+on:
+  pull_request:
+    paths:
+      - 'Gemfile'
+      - 'Gemfile.lock'
+      - 'config/**'
+      - 'app/**'
+      - 'lib/**'
+  workflow_dispatch:
+
+jobs:
+  check_gem_installation:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Verify Rails project
+        run: |
+          if [ ! -f "Gemfile" ] || [ -f "*.gemspec" ] || [ ! -d "config/environments" ]; then
+            echo "Not a Rails project or is a gem repository, skipping checks"
+            exit 78  # neutral exit for GH Actions
+          fi
+
+      - name: Install Ruby and gems
+        uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+
+      - name: Check gem installation
+        run: |
+          ruby -e '
+            require "bundler"
+            unless Bundler::Definition.build("Gemfile", nil, nil).dependencies.any? { |d| d.name == "aifinyo_utils" }
+              puts "\e[31mError: aifinyo-utils gem is required but missing from Gemfile\e[0m"
+              puts "\e[31mAdd "gem 'aifinyo_utils', github: 'aifinyo-ag/aifinyo_utils'" to your Gemfile and run its installer!\e[0m"
+              exit 1
+            end
+          '
+
+      - name: Check gem execution
+        run: |
+          bundle exec aifinyo_utils:check:install
