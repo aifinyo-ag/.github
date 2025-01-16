@@ -1,0 +1,6 @@
+{
+  "name": "Rails Repos - Utils Gem Check",
+  "description": "Workflow for checking Rails repos have the utility gem installed",
+  "iconName": "ruby",
+  "categories": ["Ruby", "Rails"]
+}
