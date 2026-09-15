@@ -1,0 +1,25 @@
+name: ecs-deploy-tag tests
+
+on:
+  pull_request:
+    paths:
+      - actions/ecs-deploy-tag/**
+      - .github/workflows/ecs-deploy-tag-test.yml
+  push:
+    branches: [main]
+    paths:
+      - actions/ecs-deploy-tag/**
+      - .github/workflows/ecs-deploy-tag-test.yml
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Run ecs-deploy-tag tests
+        run: ruby actions/ecs-deploy-tag/test/ecs_deploy_tag_test.rb
