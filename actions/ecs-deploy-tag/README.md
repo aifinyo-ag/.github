@@ -129,10 +129,13 @@ digest, not to some earlier known-good one. Only a later run that
 completes successfully re-establishes a verified state, since only
 then has the new digest actually been confirmed running everywhere.
 
-A normal cancellation sends SIGTERM, and Ruby still runs the restore
-for that (it unwinds like any other exception, through `ensure`). Only
-a harder interruption - the runner being lost, or the process being
-SIGKILLed - can cut the job off before the restore executes.
+Do not rely on the restore running when a job is cancelled. GitHub
+signals the step's shell and then kills the process tree after a short
+grace period
+([workflow cancellation](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-cancellation));
+the Ruby process started by that shell may be stopped before its
+`ensure` block runs, or not receive the signal at all. Treat every
+cancelled run after the tag has moved as described above.
 
 ## Running the tests locally
 
