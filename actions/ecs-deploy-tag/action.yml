@@ -1,0 +1,67 @@
+name: ECS deploy tag
+description: >-
+  Moves a mutable ECR tag to a new image's digest, forces an ECS
+  deployment, waits for it to stabilize, and verifies every running task
+  of a given container runs that digest - restoring the tag on failure.
+author: aifinyo-ag
+
+inputs:
+  repository:
+    description: Name of the ECR repository that holds the image.
+    required: true
+  commit-tag:
+    description: Immutable tag to deploy (its digest is retagged onto env-tag).
+    required: true
+  env-tag:
+    description: Mutable tag the ECS task definition references, for example "stage".
+    required: true
+  cluster:
+    description: Name of the ECS cluster the service runs on.
+    required: true
+  service:
+    description: Name of the ECS service to deploy.
+    required: true
+  container:
+    description: Name of the container (as defined in the task definition) whose running image digest is checked.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # Inputs are passed through env: and read back as "$VAR" rather than
+    # interpolated as ${{ inputs.* }} directly into the script, per
+    # https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions#understanding-the-risk-of-script-injections
+    - name: Check prerequisites
+      shell: bash
+      env:
+        REPOSITORY: ${{ inputs.repository }}
+        COMMIT_TAG: ${{ inputs.commit-tag }}
+        ENV_TAG: ${{ inputs.env-tag }}
+        CLUSTER: ${{ inputs.cluster }}
+        SERVICE: ${{ inputs.service }}
+        CONTAINER: ${{ inputs.container }}
+      run: |
+        [ -n "${REPOSITORY:-}" ] || { echo "::error::input 'repository' must not be empty"; exit 1; }
+        [ -n "${COMMIT_TAG:-}" ] || { echo "::error::input 'commit-tag' must not be empty"; exit 1; }
+        [ -n "${ENV_TAG:-}" ] || { echo "::error::input 'env-tag' must not be empty"; exit 1; }
+        [ -n "${CLUSTER:-}" ] || { echo "::error::input 'cluster' must not be empty"; exit 1; }
+        [ -n "${SERVICE:-}" ] || { echo "::error::input 'service' must not be empty"; exit 1; }
+        [ -n "${CONTAINER:-}" ] || { echo "::error::input 'container' must not be empty"; exit 1; }
+
+        command -v aws >/dev/null 2>&1 || { echo "::error::aws CLI not found on PATH; this action needs AWS CLI v2"; exit 1; }
+        command -v ruby >/dev/null 2>&1 || { echo "::error::ruby not found on PATH; this action needs Ruby >= 3.2"; exit 1; }
+        ruby -e 'exit(Gem::Version.new(RUBY_VERSION) >= Gem::Version.new("3.2") ? 0 : 1)' \
+          || { echo "::error::ruby >= 3.2 required, found $(ruby -v)"; exit 1; }
+
+    # Same env:-passthrough pattern as above.
+    - name: Deploy and verify
+      shell: bash
+      env:
+        REPOSITORY: ${{ inputs.repository }}
+        COMMIT_TAG: ${{ inputs.commit-tag }}
+        ENV_TAG: ${{ inputs.env-tag }}
+        CLUSTER: ${{ inputs.cluster }}
+        SERVICE: ${{ inputs.service }}
+        CONTAINER: ${{ inputs.container }}
+      run: |
+        ruby "$GITHUB_ACTION_PATH/ecs_deploy_tag.rb" "$REPOSITORY" "$COMMIT_TAG" "$ENV_TAG" "$CLUSTER" "$SERVICE" "$CONTAINER"
