@@ -47,7 +47,11 @@ Pin to a commit SHA of this repository, not a branch or tag:
 ```yaml
 jobs:
   deploy-stage:
+    needs: build-stage
     runs-on: ubuntu-24.04
+    concurrency:
+      group: deploy-app-stage
+      cancel-in-progress: false
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@<sha>
@@ -65,9 +69,12 @@ jobs:
           container: app
 ```
 
-Recommend a concurrency group per service and environment (for example
-`group: deploy-app-stage`) so overlapping runs queue instead of racing
-each other's tag moves.
+Use a concurrency group per service and environment (for example
+`deploy-app-stage`) so overlapping runs queue instead of racing each
+other's tag moves, and set `cancel-in-progress: false`: cancelling a
+run that has already moved the tag, rather than letting it finish or
+queueing behind it, is exactly the situation described in "Cancelling
+the job" below.
 
 ## Inputs
 
@@ -88,6 +95,12 @@ The calling job must provide:
   `aws-actions/configure-aws-credentials`).
 - Ruby >= 3.2 and AWS CLI v2 on the runner. `ubuntu-24.04` GitHub-hosted
   runners have both preinstalled.
+- The ECR repository must allow `env-tag` to be overwritten: set its
+  image tag mutability to `MUTABLE`, or to `IMMUTABLE_WITH_EXCLUSION`
+  with an exclusion filter matching `env-tag` (for example `stage`) so
+  that tag stays movable while other tags remain immutable. See
+  [Preventing image tags from being overwritten in Amazon
+  ECR](https://docs.aws.amazon.com/AmazonECR/latest/userguide/image-tag-mutability.html).
 - An IAM identity with at least:
   - `ecr:DescribeImages`
   - `ecr:BatchGetImage`
@@ -97,18 +110,29 @@ The calling job must provide:
   - `ecs:ListTasks`
   - `ecs:DescribeTasks`
 
-The action checks for `ruby` and `aws` on `PATH` and for Ruby >= 3.2
-before doing anything else, and fails with a clear `::error::` message if
-either is missing.
+Before doing anything else, the action checks that every input is
+non-empty and that `ruby` (>= 3.2) and `aws` are on `PATH`, and fails
+with a clear `::error::` message otherwise.
 
 ## Cancelling the job
 
 If the workflow run is cancelled after the tag has moved but before the
-action's own restore step runs, `env-tag` can be left pointing at the new
-digest even though the deployment did not (yet) verify successfully. A
-subsequent run of this action re-establishes a known-good state; a manual
-check of the running digest is also enough to decide whether to leave it
-or roll back by hand.
+action's own restore runs, `env-tag` may be left pointing at an
+unverified digest - one ECS was never confirmed to be running
+everywhere. Check it against the digest you last know to be verified
+before the next Terraform apply picks it up.
+
+A later run of this action does not by itself repair this: it reads
+whatever `env-tag` currently points at as its own "old" value, so if
+that later run also fails, it restores the tag to that same unverified
+digest, not to some earlier known-good one. Only a later run that
+completes successfully re-establishes a verified state, since only
+then has the new digest actually been confirmed running everywhere.
+
+A normal cancellation sends SIGTERM, and Ruby still runs the restore
+for that (it unwinds like any other exception, through `ensure`). Only
+a harder interruption - the runner being lost, or the process being
+SIGKILLed - can cut the job off before the restore executes.
 
 ## Running the tests locally
 
