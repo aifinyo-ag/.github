@@ -25,12 +25,11 @@
 # runs, and can likewise leave <env-tag> on the new digest.
 #
 # This is a Ruby port of a Bash version proven on a stage deployment
-# (2026-09-15). Behaviour,
-# AWS calls and flags are unchanged; --output text plus manual parsing is
-# replaced by --output json plus JSON.parse (JSON null stands in for
-# Bash's literal "None"), and AWS calls go through an injected runner
-# instead of a literal `aws` subprocess, so tests can run without network
-# access or credentials.
+# (2026-09-15). Behaviour, AWS calls and flags are unchanged; --output
+# text plus manual parsing is replaced by --output json plus JSON.parse
+# (JSON null stands in for Bash's literal "None"), and AWS calls go
+# through an injected runner instead of a literal `aws` subprocess, so
+# tests can run without network access or credentials.
 #
 # Sources (fetched and cross-checked before this port was written):
 # - https://docs.aws.amazon.com/AmazonECR/latest/userguide/image-retag.html
@@ -145,10 +144,7 @@ module EcsDeployTag
       return 1 unless point_tag_at(@env_tag, @new)
 
       deployment_id = update_service
-      if deployment_id == :error
-        @err.puts "::error::could not start a deployment of #{@cluster}/#{@service}"
-        return 1
-      end
+      return 1 if deployment_id == :error # error already reported by update_service
 
       unless wait_stable
         dep_status, dep_rollout = deployment_lookup(deployment_id)
@@ -201,29 +197,24 @@ module EcsDeployTag
     # Retags `digest` as `tag` via batch-get-image (manifest + media
     # type) and put-image. Returns true on success or when the tag
     # already names this manifest (ImageAlreadyExistsException); false
-    # (with the AWS error already printed to @err) otherwise.
+    # (with an error already printed to @err) otherwise - including when
+    # the image behind `digest` is no longer in the repository (a
+    # successful batch-get-image with no match reports JSON null, not an
+    # error) or the AWS CLI's stdout is not valid JSON. Either case would
+    # otherwise reach `put-image` with a nil manifest/media type, which
+    # Open3.capture3 raises a bare TypeError on.
     def point_tag_at(tag, digest)
-      manifest_out, manifest_err, manifest_status = @runner.call(
-        ["ecr", "batch-get-image", "--repository-name", @repository,
-         "--image-ids", "imageDigest=#{digest}",
-         "--query", "images[0].imageManifest", "--output", "json"]
-      )
-      unless manifest_status.success?
-        @err.puts manifest_err.rstrip
+      manifest, manifest_err = manifest_field(digest, "images[0].imageManifest", "manifest")
+      if manifest.nil?
+        @err.puts manifest_err
         return false
       end
-      manifest = JSON.parse(manifest_out)
 
-      media_out, media_err, media_status = @runner.call(
-        ["ecr", "batch-get-image", "--repository-name", @repository,
-         "--image-ids", "imageDigest=#{digest}",
-         "--query", "images[0].imageManifestMediaType", "--output", "json"]
-      )
-      unless media_status.success?
-        @err.puts media_err.rstrip
+      media_type, media_err = manifest_field(digest, "images[0].imageManifestMediaType", "media type")
+      if media_type.nil?
+        @err.puts media_err
         return false
       end
-      media_type = JSON.parse(media_out)
 
       _put_out, put_err, put_status = @runner.call(
         ["ecr", "put-image", "--repository-name", @repository, "--image-tag", tag,
@@ -235,6 +226,27 @@ module EcsDeployTag
 
       @err.puts put_err.rstrip
       false
+    end
+
+    # Runs one batch-get-image --query call for a single string field.
+    # Returns [value, nil] on success, or [nil, message] if the AWS call
+    # itself failed, if it succeeded but found no image for `digest`
+    # (JSON null - the image was deleted from the repository), or if its
+    # stdout was not valid JSON.
+    def manifest_field(digest, query, label)
+      out, err, status = @runner.call(
+        ["ecr", "batch-get-image", "--repository-name", @repository,
+         "--image-ids", "imageDigest=#{digest}",
+         "--query", query, "--output", "json"]
+      )
+      return [nil, err.rstrip] unless status.success?
+
+      value = JSON.parse(out)
+      return [nil, "::error::no #{label} found for #{@repository}@#{digest} (image may have been deleted)"] unless value.is_a?(String) && !value.empty?
+
+      [value, nil]
+    rescue JSON::ParserError => e
+      [nil, "::error::could not parse the #{label} for #{@repository}@#{digest} - #{e.message}"]
     end
 
     # Number of deployments currently on the service, or nil if the read
@@ -253,22 +265,36 @@ module EcsDeployTag
 
     # The id of the new PRIMARY deployment, or :error if the call itself
     # failed (a missing PRIMARY entry on an otherwise successful call is
-    # not treated as an error, matching the Bash version).
+    # not treated as an error, matching the Bash version). The AWS error
+    # text (if any) is printed to @err, matching the Bash version, where
+    # this call's stderr was never redirected and so reached the log on
+    # its own.
     def update_service
-      out, _err, status = @runner.call(
+      out, err, status = @runner.call(
         ["ecs", "update-service", "--cluster", @cluster, "--service", @service, "--force-new-deployment",
          "--query", "service.deployments[?status=='PRIMARY'].id | [0]", "--output", "json"]
       )
-      return :error unless status.success?
+      unless status.success?
+        message = "::error::could not start a deployment of #{@cluster}/#{@service}"
+        message += " - #{err.rstrip}" unless err.nil? || err.strip.empty?
+        @err.puts message
+        return :error
+      end
 
       JSON.parse(out)
     end
 
+    # true if the service became stable; false plus the AWS/waiter error
+    # text printed to @err otherwise (again matching the Bash version,
+    # where this call's stderr was never redirected).
     def wait_stable
-      _out, _err, status = @runner.call(
+      _out, err, status = @runner.call(
         ["ecs", "wait", "services-stable", "--cluster", @cluster, "--services", @service]
       )
-      status.success?
+      return true if status.success?
+
+      @err.puts err.rstrip unless err.nil? || err.strip.empty?
+      false
     end
 
     # [status, rolloutState] of the deployment identified by
@@ -317,6 +343,13 @@ module EcsDeployTag
       digests.uniq.sort.join("\n")
     end
 
+    # Called from `call`'s `ensure`, so nothing here may raise: an
+    # exception escaping `ensure` would replace whatever status `call`
+    # was about to return and skip the could-not-restore message
+    # entirely, leaving only a bare stack trace. point_tag_at already
+    # turns its own failure modes (AWS errors, a deleted image, invalid
+    # JSON) into a plain `false`, but this `rescue` is a second line of
+    # defense against anything unanticipated.
     def restore
       return unless @tag_moved && @old && !@old.empty? && @old != @new
 
@@ -325,6 +358,9 @@ module EcsDeployTag
       else
         @err.puts "::error::could not restore #{@env_tag} to #{@old} - the next Terraform apply would roll out #{@new}"
       end
+    rescue StandardError => e
+      @err.puts "::error::could not restore #{@env_tag} to #{@old} - the next Terraform apply would roll out " \
+                 "#{@new} (#{e.class}: #{e.message})"
     end
   end
 

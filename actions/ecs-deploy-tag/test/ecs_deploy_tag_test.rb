@@ -5,10 +5,10 @@
 # credentials, no real AWS calls.
 #
 # This is a 1:1 port of the 18 test cases of the Bash reference
-# implementation, renamed to snake_case test_
-# methods with the same expectations on exit status and the sequence of
-# put-image calls. The fake enforces the same required flags the bash
-# fake did, so a regression fails loudly instead of passing quietly.
+# implementation, renamed to snake_case test_ methods with the same
+# expectations on exit status and the sequence of put-image calls. The
+# fake enforces the same required flags the bash fake did, so a
+# regression fails loudly instead of passing quietly.
 #
 # All example values below (repository, tags, cluster, service, container)
 # are neutral placeholders, not environment details of any real deployment.
@@ -33,7 +33,7 @@ class FakeAws
   ENV_TAG = "stage"
   DEFAULT_TASK_ARN = "arn:aws:ecs:us-east-1:123456789012:task/c/1"
 
-  attr_reader :put_log
+  attr_reader :put_log, :calls
 
   # opts keys (all optional, matching the Bash fake's FAKE_* variables):
   #   :new, :old                     - digests digest_of should report
@@ -43,20 +43,34 @@ class FakeAws
   #   :put_fail_first                - first put-image call fails with ThrottlingException, then succeeds
   #   :deployments                   - deployment count returned by the pre-flight check (default 1)
   #   :update_exit                   - non-zero exit status for update-service (default 0)
+  #   :update_service_malformed_json - update-service reports success but returns unparsable JSON
   #   :deployment_id                 - id update-service hands back (default "ecs-svc/111")
   #   :wait_exit                     - exit status for wait services-stable (default 0)
   #   :deployment_status/:deployment_rollout - values for the post-wait-failure lookup (default "ACTIVE"/"FAILED")
   #   :lookup_exit                   - non-zero exit status for the post-wait-failure describe-services lookup
   #   :tasks                         - explicit task ARNs (default one dummy ARN); [] means none
   #   :running                       - explicit running digest(s), array; defaults to [opts[:new]] if unset
+  #   :missing_manifest_digest       - batch-get-image reports success but no image (JSON null) for this digest,
+  #                                    simulating an image that has since been deleted from the repository
   def initialize(opts = {})
     @opts = opts
     @put_log = []
     @put_count = 0
+    @calls = []
   end
 
   def call(args)
+    @calls << args
     service, action = args[0], args[1]
+
+    # Every call other than the waiter must ask for JSON: a regression
+    # back to --output text (the Bash version's format) must fail loudly
+    # here rather than silently parsing garbage.
+    unless [service, action] == %w[ecs wait]
+      output = value_of(args, "--output")
+      return fail_hard("#{service} #{action}: expected --output json, got #{output.inspect}") unless output == "json"
+    end
+
     if service == "ecr"
       repo = value_of(args, "--repository-name")
       return fail_hard("#{action}: missing/wrong --repository-name (got #{repo.inspect})") unless repo == REPOSITORY
@@ -132,6 +146,12 @@ class FakeAws
     ids = value_of(args, "--image-ids")
     digest = ids.sub(/\AimageDigest=/, "")
     query = value_of(args, "--query")
+
+    # A successful call with no matching image (the digest was deleted
+    # from the repository): AWS CLI's --query renders the empty result
+    # as JSON null, not an error.
+    return ok("null") if @opts[:missing_manifest_digest] == digest
+
     case query
     when "images[0].imageManifestMediaType"
       ok("application/vnd.docker.distribution.manifest.v2+json".to_json)
@@ -192,7 +212,8 @@ class FakeAws
 
   def update_service(args)
     return fail_hard("update-service: missing --force-new-deployment") unless has_flag(args, "--force-new-deployment")
-    return ["", "", Status.new(@opts[:update_exit])] if @opts[:update_exit] && @opts[:update_exit] != 0
+    return aws_error("ThrottlingException", "UpdateService", status: @opts[:update_exit]) if @opts[:update_exit] && @opts[:update_exit] != 0
+    return ok("not valid json") if @opts[:update_service_malformed_json]
 
     ok((@opts[:deployment_id] || "ecs-svc/111").to_json)
   end
@@ -202,7 +223,9 @@ class FakeAws
   def wait_services_stable(args)
     return fail_hard("wait: expected services-stable, got '#{args[2]}'") unless args[2] == "services-stable"
 
-    ["", "", Status.new(@opts[:wait_exit] || 0)]
+    exit_status = @opts[:wait_exit] || 0
+    stderr = exit_status.zero? ? "" : "Waiter ServicesStable failed: Max attempts exceeded\n"
+    [+"", stderr, Status.new(exit_status)]
   end
 
   # --- ecs list-tasks -------------------------------------------------------
@@ -226,9 +249,8 @@ class FakeAws
 end
 
 class EcsDeployTagTest < Minitest::Test
-  def deploy(opts)
-    fake = FakeAws.new(opts)
-    deployer = EcsDeployTag::Deployer.new(
+  def build_deployer(fake)
+    EcsDeployTag::Deployer.new(
       repository: FakeAws::REPOSITORY,
       commit_tag: FakeAws::COMMIT_TAG,
       env_tag: FakeAws::ENV_TAG,
@@ -237,7 +259,11 @@ class EcsDeployTagTest < Minitest::Test
       container: "app",
       runner: fake.method(:call)
     )
-    status = deployer.call
+  end
+
+  def deploy(opts)
+    fake = FakeAws.new(opts)
+    status = build_deployer(fake).call
     [status, fake.put_log]
   end
 
@@ -260,9 +286,12 @@ class EcsDeployTagTest < Minitest::Test
   end
 
   def test_service_not_stable_restores_the_tag
-    status, log = deploy(new: "sha256:new", old: "sha256:old", wait_exit: 255)
-    assert_equal 1, status
-    assert_equal ["put stage sha256:new", "put stage sha256:old"], log
+    out, err = capture_io do
+      @last_status, @last_log = deploy(new: "sha256:new", old: "sha256:old", wait_exit: 255)
+    end
+    assert_equal 1, @last_status
+    assert_equal ["put stage sha256:new", "put stage sha256:old"], @last_log
+    assert_includes(out + err, "Max attempts exceeded")
   end
 
   def test_rolled_back_service_restores_the_tag
@@ -284,15 +313,21 @@ class EcsDeployTagTest < Minitest::Test
   end
 
   def test_update_service_error_restores_the_tag
-    status, log = deploy(new: "sha256:new", old: "sha256:old", update_exit: 254)
-    assert_equal 1, status
-    assert_equal ["put stage sha256:new", "put stage sha256:old"], log
+    out, err = capture_io do
+      @last_status, @last_log = deploy(new: "sha256:new", old: "sha256:old", update_exit: 254)
+    end
+    assert_equal 1, @last_status
+    assert_equal ["put stage sha256:new", "put stage sha256:old"], @last_log
+    assert_includes(out + err, "ThrottlingException")
   end
 
   def test_a_new_tag_has_nothing_to_restore
-    status, log = deploy(new: "sha256:new", wait_exit: 255)
+    fake = FakeAws.new(new: "sha256:new", wait_exit: 255)
+    status = build_deployer(fake).call
     assert_equal 1, status
-    assert_equal ["put stage sha256:new"], log
+    assert_equal ["put stage sha256:new"], fake.put_log
+    refute fake.calls.any? { |a| a[0, 2] == %w[ecr batch-get-image] && a.include?("imageDigest=") },
+           "expected no restore attempt (no batch-get-image for an empty digest)"
   end
 
   def test_env_tag_read_error_stops_before_moving_the_tag
@@ -354,5 +389,33 @@ class EcsDeployTagTest < Minitest::Test
     assert_equal 1, @last_status
     assert_equal ["put stage sha256:new", "put stage sha256:old"], @last_log
     assert_includes(out + err, "ThrottlingException")
+  end
+
+  # --- additional cases from fix round 1 (not part of the Bash suite) -----
+
+  # An unexpected exception mid-deploy (here: unparsable JSON from
+  # update-service, after the tag has already moved) must still be caught,
+  # reported without a bare stack trace, and must still restore the tag.
+  # Removing the top-level `rescue StandardError` in Deployer#call turns
+  # this test red (an uncaught JSON::ParserError instead of a clean 1).
+  def test_invalid_aws_response_during_deploy_still_restores_the_tag
+    status, log = deploy(new: "sha256:new", old: "sha256:old", update_service_malformed_json: true)
+    assert_equal 1, status
+    assert_equal ["put stage sha256:new", "put stage sha256:old"], log
+  end
+
+  # If the old digest's image has since been deleted from the repository,
+  # restoring the tag to it is impossible. This must fail cleanly with the
+  # documented could-not-restore message (never a bare TypeError from
+  # passing a nil manifest to the put-image call), and still exit 1.
+  # Removing the "::error::could not restore ..." line turns this test red.
+  def test_failed_restore_when_old_image_is_gone_reports_could_not_restore
+    out, err = capture_io do
+      @last_status, @last_log = deploy(new: "sha256:new", old: "sha256:old", wait_exit: 255,
+                                        missing_manifest_digest: "sha256:old")
+    end
+    assert_equal 1, @last_status
+    assert_equal ["put stage sha256:new"], @last_log
+    assert_includes(out + err, "could not restore stage to sha256:old")
   end
 end
