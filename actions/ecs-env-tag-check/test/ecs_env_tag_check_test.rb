@@ -9,8 +9,9 @@
 # snake_case test_ methods with the same expectations on exit status and
 # output. The Bash test grepped stdout and stderr merged; these tests also
 # check the stream: errors on stderr, "ok:" and skip lines on stdout. The
-# fake enforces the same required flags the Bash fake did, so a regression
-# fails loudly instead of passing quietly.
+# fake compares the full argument list of every call with the one the
+# checker must send (only the order of the --tasks values is free), so an
+# added, dropped or changed flag fails loudly instead of passing quietly.
 #
 # All example values below (repository, tag, cluster, service, container,
 # task ARNs) are neutral placeholders, not environment details of any real
@@ -68,8 +69,10 @@ class FakeAws
   #   :describe_services_error, :tag_error, :list_tasks_error, :describe_tasks_error
   #                           - make that call fail like the real CLI does,
   #                             with this exception name
-  #   :describe_services_malformed_json - describe-services succeeds but
-  #                             prints something that is not JSON
+  #   :malformed_json         - the action ("describe-services",
+  #                             "describe-images", "list-tasks" or
+  #                             "describe-tasks") that succeeds but prints
+  #                             something that is not JSON
   #   :tag_without_digest     - describe-images succeeds but reports no image
   # Every describe-services call starts one full read of the service. The
   # checker may re-read once after a mismatch, never more; from the second
@@ -83,37 +86,27 @@ class FakeAws
 
   def call(args)
     @calls << args
-    service, action = args[0], args[1]
+    stdout, stderr, status =
+      case args[0, 2]
+      when %w[ecs describe-services] then describe_services(args)
+      when %w[ecr describe-images] then describe_images(args)
+      when %w[ecs list-tasks] then list_tasks(args)
+      when %w[ecs describe-tasks] then describe_tasks(args)
+      else fail_hard("unexpected: aws #{args.join(' ')}")
+      end
+    return ["not valid json", stderr, status] if status.success? && @opts[:malformed_json] == args[1]
 
-    # Every call must ask for JSON and get the full response: --output
-    # text would not parse, and a --query would change the shape of the
-    # response the checker reads.
-    output = value_of(args, "--output")
-    return fail_hard("#{service} #{action}: expected --output json, got #{output.inspect}") unless output == "json"
-    return fail_hard("#{service} #{action}: unexpected --query") if args.include?("--query")
-
-    case [service, action]
-    when %w[ecs describe-services] then describe_services(args)
-    when %w[ecr describe-images] then describe_images(args)
-    when %w[ecs list-tasks] then list_tasks(args)
-    when %w[ecs describe-tasks] then describe_tasks(args)
-    else fail_hard("unexpected: aws #{args.join(' ')}")
-    end
+    [stdout, stderr, status]
   end
 
   private
 
-  def value_of(args, flag)
-    idx = args.index(flag)
-    idx && args[idx + 1]
-  end
-
-  # Every value after `flag` up to the next --flag.
-  def values_of(args, flag)
-    idx = args.index(flag)
-    return [] unless idx
-
-    args[(idx + 1)..].take_while { |a| !a.start_with?("--") }
+  # Every handler compares the full argument list with the one the
+  # checker must send: an added flag (--max-items, --no-paginate, --query,
+  # --region, ...), a dropped or reordered one, or --output other than
+  # json is rejected.
+  def unexpected_args(args, expected)
+    fail_hard("unexpected arguments: aws #{args.join(' ')} (expected: aws #{expected.join(' ')})")
   end
 
   # The fixture for the current read: <key>_retry from the second read on
@@ -155,16 +148,12 @@ class FakeAws
   # --- ecs describe-services ---------------------------------------------
 
   def describe_services(args)
-    cluster = value_of(args, "--cluster")
-    return fail_hard("describe-services: missing/wrong --cluster (got #{cluster.inspect})") unless cluster == CLUSTER
-
-    services = value_of(args, "--services")
-    return fail_hard("describe-services: missing/wrong --services (got #{services.inspect})") unless services == SERVICE
+    expected = ["ecs", "describe-services", "--cluster", CLUSTER, "--services", SERVICE, "--output", "json"]
+    return unexpected_args(args, expected) unless args == expected
 
     @reads += 1
     return fail_hard("describe-services: read #{@reads} times, the checker may re-read only once") if @reads > 2
     return aws_error(@opts[:describe_services_error], "DescribeServices") if @opts[:describe_services_error]
-    return ok("not valid json") if @opts[:describe_services_malformed_json]
     return ok(@opts[:describe_services_json].to_json) if @opts[:describe_services_json]
 
     deployments = fixture(:deployments, [{ "status" => "PRIMARY", "rolloutState" => "COMPLETED" }])
@@ -176,11 +165,10 @@ class FakeAws
   # --- ecr describe-images -------------------------------------------------
 
   def describe_images(args)
-    repo = value_of(args, "--repository-name")
-    return fail_hard("describe-images: missing/wrong --repository-name (got #{repo.inspect})") unless repo == REPOSITORY
+    expected = ["ecr", "describe-images", "--repository-name", REPOSITORY, "--image-ids", "imageTag=#{ENV_TAG}",
+                "--output", "json"]
+    return unexpected_args(args, expected) unless args == expected
 
-    ids = value_of(args, "--image-ids")
-    return fail_hard("describe-images: unexpected --image-ids #{ids.inspect}") unless ids == "imageTag=#{ENV_TAG}"
     return aws_error(@opts[:tag_error], "DescribeImages") if @opts[:tag_error]
     return ok({ "imageDetails" => [] }.to_json) if @opts[:tag_without_digest]
 
@@ -190,14 +178,10 @@ class FakeAws
   # --- ecs list-tasks ---------------------------------------------------------
 
   def list_tasks(args)
-    cluster = value_of(args, "--cluster")
-    return fail_hard("list-tasks: missing/wrong --cluster (got #{cluster.inspect})") unless cluster == CLUSTER
+    expected = ["ecs", "list-tasks", "--cluster", CLUSTER, "--service-name", SERVICE, "--desired-status", "RUNNING",
+                "--output", "json"]
+    return unexpected_args(args, expected) unless args == expected
 
-    service = value_of(args, "--service-name")
-    return fail_hard("list-tasks: missing/wrong --service-name (got #{service.inspect})") unless service == SERVICE
-
-    desired = value_of(args, "--desired-status")
-    return fail_hard("list-tasks: expected --desired-status RUNNING, got #{desired.inspect}") unless desired == "RUNNING"
     return aws_error(@opts[:list_tasks_error], "ListTasks") if @opts[:list_tasks_error]
 
     ok({ "taskArns" => list_task_arns }.to_json)
@@ -206,16 +190,25 @@ class FakeAws
   # --- ecs describe-tasks -------------------------------------------------------
 
   def describe_tasks(args)
-    cluster = value_of(args, "--cluster")
-    return fail_hard("describe-tasks: missing/wrong --cluster (got #{cluster.inspect})") unless cluster == CLUSTER
-    return fail_hard("describe-tasks: missing --tasks") unless args.include?("--tasks")
+    prefix = ["ecs", "describe-tasks", "--cluster", CLUSTER, "--tasks"]
+    suffix = ["--output", "json"]
+    expected = prefix + list_task_arns + suffix
+    unless args.length >= prefix.length + suffix.length &&
+           args.first(prefix.length) == prefix && args.last(suffix.length) == suffix
+      return unexpected_args(args, expected)
+    end
+
+    # The real CLI refuses --tasks without a value before it calls AWS:
+    # --tasks is a required list parameter, which AWS CLI v2 parses with
+    # argparse nargs='+' (awscli/arguments.py in v2.36.4; see also
+    # `aws ecs describe-tasks help`: "--tasks (list) [required]").
+    asked = args[prefix.length...-suffix.length]
+    return fail_hard("describe-tasks: --tasks needs at least one task ARN") if asked.empty?
 
     # Every task ARN list-tasks returned must reach describe-tasks, and
-    # nothing else.
-    asked = values_of(args, "--tasks")
-    unless asked.sort == list_task_arns.sort
-      return fail_hard("describe-tasks: expected --tasks #{list_task_arns.sort.join(' ')}, got #{asked.sort.join(' ')}")
-    end
+    # nothing else; only their order is free.
+    return unexpected_args(args, expected) unless asked.sort == list_task_arns.sort
+
     return aws_error(@opts[:describe_tasks_error], "DescribeTasks") if @opts[:describe_tasks_error]
 
     known = tasks
@@ -376,8 +369,13 @@ class EcsEnvTagCheckTest < Minitest::Test
 
   # --- running tasks -------------------------------------------------------------
 
+  # No task ARN from list-tasks ends the check before describe-tasks, which
+  # the real CLI would refuse with an empty --tasks.
   def test_no_running_task
-    check 1, "::error::no running task on app-stage/app", tasks: []
+    result = check 1, "::error::no running task on app-stage/app", tasks: []
+    assert_equal "::error::no running task on app-stage/app\n", result.err
+    assert_equal [%w[ecs describe-services], %w[ecr describe-images], %w[ecs list-tasks]],
+                 result.fake.calls.map { |c| c[0, 2] }
   end
 
   def test_only_a_task_that_is_not_running_yet
@@ -498,12 +496,30 @@ class EcsEnvTagCheckTest < Minitest::Test
     end
   end
 
-  # Unparsable AWS output must end as one "::error::" line and exit 1,
-  # never a bare stack trace.
+  # Unparsable AWS output must end as one "::error::" line that names the
+  # call, and exit 1 - never a bare stack trace.
   def test_invalid_json_from_aws_is_reported_not_raised
-    result = run_check({ describe_services_malformed_json: true })
-    assert_equal 1, result.status
-    assert_includes result.err, "::error::unexpected error: JSON::ParserError"
+    {
+      "describe-services" => "could not read app-stage/app",
+      "describe-images" => "could not read app:stage",
+      "list-tasks" => "could not list tasks of app-stage/app",
+      "describe-tasks" => "could not describe tasks of app-stage/app"
+    }.each do |action, description|
+      result = check 1, "::error::#{description} - the aws output is not valid JSON", malformed_json: action
+      assert_equal 1, result.err.lines.length, action
+    end
+  end
+
+  # Any other exception - here the one Open3.capture3 raises when `aws` is
+  # not on PATH - also ends as one "::error::" line and exit 1.
+  def test_an_unexpected_exception_is_reported_not_raised
+    err = StringIO.new
+    status = EcsEnvTagCheck::Checker.new(
+      repository: "app", env_tag: "stage", cluster: "app-stage", service: "app", container: "app",
+      runner: ->(_args) { raise Errno::ENOENT, "aws" }, out: StringIO.new, err: err, sleeper: ->(_) {}
+    ).call
+    assert_equal 1, status
+    assert_equal "::error::unexpected error: Errno::ENOENT: No such file or directory - aws\n", err.string
   end
 
   # A successful describe-images without a digest (not expected from AWS
@@ -514,5 +530,130 @@ class EcsEnvTagCheckTest < Minitest::Test
     assert_equal 1, result.status
     assert_includes result.err, "::error::could not read app:stage - describe-images returned no imageDigest"
     assert_empty result.sleeps
+  end
+
+  # --- fail-closed rules on the describe-services response ---------------------
+
+  COMPLETED_SERVICE = { "serviceName" => "app", "status" => "ACTIVE",
+                        "deployments" => [{ "status" => "PRIMARY", "rolloutState" => "COMPLETED" }] }.freeze
+
+  def test_describe_services_without_a_service_or_a_failure
+    result = check 1, "::error::could not read app-stage/app - describe-services returned 0 services",
+                   describe_services_json: { "services" => [], "failures" => [] }
+    assert_equal 1, result.fake.calls.length
+  end
+
+  def test_describe_services_with_two_services
+    result = check 1, "::error::could not read app-stage/app - describe-services returned 2 services",
+                   describe_services_json: { "services" => [COMPLETED_SERVICE, COMPLETED_SERVICE], "failures" => [] }
+    assert_equal 1, result.fake.calls.length
+  end
+
+  # A failure entry fails the check even when its reason is empty (the
+  # Bash version joined the reasons and went on when that was empty).
+  def test_a_describe_services_failure_with_an_empty_reason
+    result = check 1, "::error::could not read app-stage/app - describe-services reported failures: unknown",
+                   describe_services_json: {
+                     "services" => [COMPLETED_SERVICE],
+                     "failures" => [{ "arn" => "arn:aws:ecs:eu-central-1:123456789012:service/app-stage/app",
+                                      "reason" => "" }]
+                   }
+    assert_equal 1, result.fake.calls.length
+  end
+
+  # The status check comes before the skip: a service that is not ACTIVE
+  # fails even while it has more than one deployment.
+  def test_a_draining_service_with_two_deployments_fails_and_is_not_skipped
+    result = check 1, "::error::app-stage/app is DRAINING, not ACTIVE",
+                   service_status: "DRAINING",
+                   deployments: [{ "status" => "PRIMARY", "rolloutState" => "IN_PROGRESS" },
+                                 { "status" => "ACTIVE", "rolloutState" => "COMPLETED" }]
+    assert_empty result.out
+  end
+
+  # One deployment that is not PRIMARY, or none at all: fail closed as "no
+  # PRIMARY deployment" (the Bash version said "rolloutState (missing)"),
+  # never compare against a non-PRIMARY deployment's rolloutState.
+  def test_a_service_without_a_primary_deployment
+    [[{ "status" => "ACTIVE", "rolloutState" => "COMPLETED" }], []].each do |deployments|
+      result = check 1, "::error::cannot check app-stage/app: it has no PRIMARY deployment", deployments: deployments
+      assert_equal 1, result.fake.calls.length
+    end
+  end
+
+  # --- running tasks and digests ------------------------------------------------
+
+  def test_running_task_with_an_empty_image_digest
+    check 1, "::error::container app reports no imageDigest on running task(s) #{ARN}/1 of app-stage/app",
+          tasks: [task(1, "RUNNING", "")]
+  end
+
+  # The digests arrive in reverse order and are reported sorted.
+  def test_running_digests_are_reported_sorted
+    check 1, "::error::stage points to sha256:aaa, but app-stage/app runs sha256:aaa, sha256:bbb " \
+             "(also on a re-read 0s later)",
+          tasks: [task(1, "RUNNING", "sha256:bbb"), task(2, "RUNNING", "sha256:aaa")]
+  end
+
+  # describe-tasks answering with the same taskArn twice (not expected from
+  # AWS): every entry is checked on its own, so one that is fine cannot
+  # hide one that is not - as in the Bash version, which went through every
+  # entry of tasks[].
+  def test_a_repeated_task_arn_does_not_hide_a_task_without_the_container
+    check 1, "::error::no container app on running task(s) #{ARN}/1 of app-stage/app",
+          list_task_arns: ["#{ARN}/1"],
+          tasks: [{ "taskArn" => "#{ARN}/1", "lastStatus" => "RUNNING",
+                    "containers" => [{ "name" => "log-router", "imageDigest" => "sha256:aaa" }] },
+                  task(1, "RUNNING", "sha256:aaa")]
+  end
+
+  def test_a_repeated_task_arn_does_not_hide_a_task_without_an_image_digest
+    check 1, "::error::container app reports no imageDigest on running task(s) #{ARN}/1 of app-stage/app",
+          list_task_arns: ["#{ARN}/1"],
+          tasks: [task(1, "RUNNING", nil), task(1, "RUNNING", "sha256:aaa")]
+  end
+
+  def test_a_repeated_task_arn_does_not_hide_a_different_digest
+    check 1, "::error::stage points to sha256:aaa, but app-stage/app runs sha256:aaa, sha256:bbb " \
+             "(also on a re-read 0s later)",
+          list_task_arns: ["#{ARN}/1"],
+          tasks: [task(1, "RUNNING", "sha256:bbb"), task(1, "RUNNING", "sha256:aaa")]
+  end
+
+  # --- the fake itself -----------------------------------------------------------
+
+  # The fake accepts exactly the four calls the checker makes (the --tasks
+  # values in any order) and rejects every other argument list, so a flag
+  # added to, dropped from or changed in a call of the checker - for
+  # example --max-items 1 or --no-paginate on list-tasks, which would hide
+  # tasks - fails the tests.
+  def test_the_fake_accepts_only_the_exact_calls_of_the_checker
+    opts = { tasks: [task(1, "RUNNING", "sha256:aaa"), task(2, "RUNNING", "sha256:aaa")] }
+    exact = [
+      %w[ecs describe-services --cluster app-stage --services app --output json],
+      %w[ecr describe-images --repository-name app --image-ids imageTag=stage --output json],
+      %w[ecs list-tasks --cluster app-stage --service-name app --desired-status RUNNING --output json],
+      ["ecs", "describe-tasks", "--cluster", "app-stage", "--tasks", "#{ARN}/2", "#{ARN}/1", "--output", "json"]
+    ]
+    exact.each do |args|
+      fake = FakeAws.new(opts)
+      assert fake.call(args)[2].success?, "rejected: aws #{args.join(' ')}"
+      assert_empty fake.rejections
+    end
+
+    wrong = exact.flat_map do |args|
+      [args[0...-2] + ["--no-paginate"] + args[-2..],
+       args + ["--max-items", "1"],
+       args[0...-2] + ["--query", "taskArns"] + args[-2..],
+       args[0...-1] + ["text"],
+       args[0, 2] + args[4..]]
+    end
+    wrong << %w[ecs describe-tasks --cluster app-stage --tasks --output json]
+    wrong << ["ecs", "describe-tasks", "--cluster", "app-stage", "--tasks", "#{ARN}/1", "--output", "json"]
+    wrong.each do |args|
+      fake = FakeAws.new(opts)
+      refute fake.call(args)[2].success?, "accepted: aws #{args.join(' ')}"
+      refute_empty fake.rejections
+    end
   end
 end
