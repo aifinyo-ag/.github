@@ -7,10 +7,27 @@ of the service would not silently roll out a different image than the one
 that is running.
 
 It is a Ruby port of a reviewed Bash check from `aifinyo-ag/Hubspot`
-(`.github/scripts/check-env-tag.sh`). The decisions, the AWS CLI calls,
-and their flags are unchanged; only the JSON handling moved from `jq` to
-Ruby. It is the counterpart of [`ecs-deploy-tag`](../ecs-deploy-tag),
-which moves such a tag and deploys it.
+(`.github/scripts/check-env-tag.sh`). The AWS CLI calls and their flags
+are the same, and the JSON handling moved from `jq` to Ruby. It is the
+counterpart of [`ecs-deploy-tag`](../ecs-deploy-tag), which moves such a
+tag and deploys it.
+
+Deliberate differences from the Bash version:
+
+- `retry-seconds` is an input (the script's sixth argument), not the
+  `CHECK_ENV_TAG_RETRY_SECONDS` environment variable.
+- A `describe-services` failure entry with an empty `reason` fails the
+  check; the Bash version went on.
+- A successful `describe-images` without an `imageDigest` fails at once;
+  the Bash version compared against the string `null`.
+- A missing or `null` `taskArns` or `tasks` list, or AWS output that is
+  not JSON, ends in a clean `::error::` line; the Bash version crashed in
+  `jq`.
+- A service whose one deployment is not `PRIMARY`, or that has none,
+  fails as `no PRIMARY deployment`; the Bash version failed with
+  `rolloutState (missing)`.
+- A running task without a `taskArn` is still checked for `container`;
+  in the Bash version such a task without `container` could pass.
 
 ## What it does
 
@@ -19,7 +36,8 @@ which moves such a tag and deploys it.
    progress - more than one deployment, or the `PRIMARY` deployment's
    `rolloutState` is `IN_PROGRESS` - it stops here and exits `0` without
    comparing anything (see [Skipped](#what-skipped-means)). Any other
-   `rolloutState` (`FAILED`, or none at all) is an error.
+   `rolloutState` (`FAILED`, or none at all) is an error, and so is a
+   service whose one deployment is not `PRIMARY`, or that has none.
 2. Reads the digest `env-tag` points to (`ecr describe-images`). A missing
    tag is an error: unlike a commit tag, the environment tag is expected
    to always exist.
@@ -130,6 +148,11 @@ The calling job must provide:
   such services
   ([Deployment](https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_Deployment.html));
   for any other service, step 1 fails with `rolloutState (missing)`.
+- At most 100 tasks with desired status `RUNNING` on the service.
+  `describe-tasks` accepts at most 100 task ARNs
+  ([DescribeTasks](https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_DescribeTasks.html))
+  and the check describes all of them in one call, so a service with
+  more than 100 tasks fails. Batching is out of scope.
 
 Before doing anything else, the action checks that every input is
 non-empty, that `retry-seconds` is a non-negative integer, and that
@@ -143,7 +166,7 @@ non-empty, that `retry-seconds` is a non-negative integer, and that
 | `0` | `ok: <env-tag> = <digest> runs on <cluster>/<service>` | Every running task of `container` runs the digest `env-tag` points to. |
 | `0` | `deployment in progress on <cluster>/<service>, not checked` | Skipped: a rollout is in progress, nothing was compared. |
 | `1` | `::error::<env-tag> points to X, but <cluster>/<service> runs Y ...` | Drift, on the first read and on the re-read. |
-| `1` | `::error::...` | Anything else - the check fails closed: a missing or inactive service, a `FAILED` or missing `rolloutState`, a missing tag, no running task, a running task without `container` or without an `imageDigest` for it, a failure reported by `describe-services` or `describe-tasks`, any AWS error, or invalid arguments. |
+| `1` | `::error::...` | Anything else - the check fails closed: a missing or inactive service, a `FAILED` or missing `rolloutState`, no `PRIMARY` deployment, a missing tag, no running task, a running task without `container` or without an `imageDigest` for it, a failure reported by `describe-services` or `describe-tasks`, any AWS error, AWS output that is not JSON, or invalid arguments. |
 
 Errors go to stderr as `::error::` lines, so they show up as annotations
 on the run; `ok:` and skip lines go to stdout.

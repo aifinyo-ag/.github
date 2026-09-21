@@ -16,7 +16,8 @@
 #    rollout in progress, not drift - running digests are expected to
 #    disagree with the tag's target until ECS finishes converging - so
 #    this exits 0 without comparing anything. Any other rolloutState
-#    (FAILED, missing) is an error.
+#    (FAILED, missing) is an error, and so is a service whose one
+#    deployment is not PRIMARY, or that has none.
 # 2. Read the digest <repository>:<env-tag> points to in ECR.
 # 3. Read the image digest of <container> on every task of the service
 #    whose lastStatus is RUNNING (tasks still starting or stopping are
@@ -28,19 +29,35 @@
 #
 # Fails closed: exit 0 only for "no drift" or "deployment in progress".
 # Exit 1: drift (also on the re-read), a missing or inactive service, a
-# FAILED or unknown rollout, a missing tag, no running task, a running task
-# without a digest for <container>, any AWS read error or reported
-# failure, or wrong arguments.
+# FAILED or unknown rollout, no PRIMARY deployment, a missing tag, no
+# running task, a running task without a digest for <container>, any AWS
+# read error or reported failure, output that is not JSON, or wrong
+# arguments.
 #
 # This is a Ruby port of the reviewed Bash check in aifinyo-ag/Hubspot
-# (.github/scripts/check-env-tag.sh). Behaviour, AWS calls and flags are
-# unchanged: every call still reads the full --output json response, and
+# (.github/scripts/check-env-tag.sh). The AWS calls and their flags are
+# the same: every call still reads the full --output json response, and
 # JSON.parse plus plain Ruby replaces jq. AWS calls go through an injected
 # runner instead of a literal `aws` subprocess, and the pause before the
 # re-read through an injected sleeper, so tests can run without network
-# access, credentials or waiting. One deliberate difference: a successful
-# describe-images without an imageDigest is reported as an error right
-# away, where the Bash version compared against the string "null".
+# access, credentials or waiting. Deliberate differences from the Bash
+# version:
+# - <retry-seconds> is an argument (the action's retry-seconds input),
+#   not the CHECK_ENV_TAG_RETRY_SECONDS environment variable.
+# - A describe-services failure entry with an empty reason fails the
+#   check; the Bash version joined the reasons and went on when the
+#   result was empty.
+# - A successful describe-images without an imageDigest fails at once;
+#   the Bash version compared against the string "null".
+# - A missing or null taskArns or tasks list, or output that is not JSON,
+#   ends in a clean ::error:: line (for output that is not JSON, one that
+#   names the call); the Bash version crashed in jq.
+# - A service whose one deployment is not PRIMARY, or that has none,
+#   fails as "no PRIMARY deployment"; the Bash version failed with
+#   "rolloutState (missing)".
+# - A running task without a taskArn is still checked for <container>;
+#   the Bash version's jq join turned the null ARN into an empty string,
+#   so such a task without <container> could pass.
 #
 # Sources (each URL confirmed reachable before this port was written; the
 # AWS field names, values and limits noted below also match the service
@@ -184,7 +201,15 @@ module EcsEnvTagCheck
       out, err, status = @runner.call([*args, "--output", "json"])
       fail! "could not #{description} - #{err.to_s.rstrip}" unless status.success?
 
+      parse_json(description, out)
+    end
+
+    # Parses the stdout of a successful `aws` call; output that is not
+    # JSON raises Failed naming the call, not a bare JSON::ParserError.
+    def parse_json(description, out)
       JSON.parse(out)
+    rescue JSON::ParserError
+      fail! "could not #{description} - the aws output is not valid JSON"
     end
 
     # 1. The service and its deployments: true if a rollout is in
@@ -193,15 +218,18 @@ module EcsEnvTagCheck
       response = aws_json("read #{@cluster}/#{@service}",
                           "ecs", "describe-services", "--cluster", @cluster, "--services", @service)
 
+      # Any failure entry fails the check, also one with an empty reason.
       failures = Array(response["failures"])
       unless failures.empty?
-        reasons = failures.map { |f| f["reason"] || "unknown" }.join(", ")
+        reasons = failures.map { |f| f["reason"].to_s.empty? ? "unknown" : f["reason"] }.join(", ")
         fail! "could not read #{@cluster}/#{@service} - describe-services reported failures: #{reasons}"
       end
 
       services = Array(response["services"])
       fail! "could not read #{@cluster}/#{@service} - describe-services returned #{services.length} services" unless services.length == 1
 
+      # The status check comes before the skip below: a service that is
+      # not ACTIVE fails even while it has more than one deployment.
       service = services.first
       status = service["status"] || "(missing)"
       fail! "#{@cluster}/#{@service} is #{status}, not ACTIVE" unless status == "ACTIVE"
@@ -210,7 +238,9 @@ module EcsEnvTagCheck
       return true if deployments.length > 1
 
       primary = deployments.find { |d| d["status"] == "PRIMARY" }
-      rollout = (primary && primary["rolloutState"]) || "(missing)"
+      fail! "cannot check #{@cluster}/#{@service}: it has no PRIMARY deployment" unless primary
+
+      rollout = primary["rolloutState"] || "(missing)"
       case rollout
       when "COMPLETED" then false
       when "IN_PROGRESS" then true
@@ -233,7 +263,8 @@ module EcsEnvTagCheck
         fail! "could not read #{@repository}:#{@env_tag} - #{err.to_s.rstrip}"
       end
 
-      digest = Array(JSON.parse(out)["imageDetails"]).first&.fetch("imageDigest", nil)
+      details = parse_json("read #{@repository}:#{@env_tag}", out)["imageDetails"]
+      digest = Array(details).first&.fetch("imageDigest", nil)
       fail! "could not read #{@repository}:#{@env_tag} - describe-images returned no imageDigest" unless digest.is_a?(String) && !digest.empty?
 
       digest
@@ -249,6 +280,9 @@ module EcsEnvTagCheck
       task_arns = Array(listed["taskArns"])
       fail! "no running task on #{@cluster}/#{@service}" if task_arns.empty?
 
+      # One call for all task ARNs: describe-tasks accepts at most 100 task
+      # ARNs, so a service with more than 100 tasks listed here fails.
+      # Batching is out of scope.
       described = aws_json("describe tasks of #{@cluster}/#{@service}",
                            "ecs", "describe-tasks", "--cluster", @cluster, "--tasks", *task_arns)
       failures = Array(described["failures"])
@@ -260,17 +294,20 @@ module EcsEnvTagCheck
       running = Array(described["tasks"]).select { |t| t["lastStatus"] == "RUNNING" }
       fail! "no running task on #{@cluster}/#{@service} (none of its tasks has lastStatus RUNNING yet)" if running.empty?
 
-      containers = running.to_h { |t| [t["taskArn"], Array(t["containers"]).select { |c| c["name"] == @container }] }
+      # One [taskArn, matching containers] pair per running task entry. A
+      # list, not a hash keyed by taskArn: a hash would keep only the last
+      # of two entries with the same taskArn and could hide the other one.
+      pairs = running.map { |t| [t["taskArn"], Array(t["containers"]).select { |c| c["name"] == @container }] }
 
-      missing = containers.select { |_arn, matching| matching.empty? }.keys
+      missing = pairs.select { |_arn, matching| matching.empty? }.map(&:first)
       fail! "no container #{@container} on running task(s) #{missing.join(', ')} of #{@cluster}/#{@service}" unless missing.empty?
 
-      missing = containers.select { |_arn, matching| matching.any? { |c| c["imageDigest"].to_s.empty? } }.keys
+      missing = pairs.select { |_arn, matching| matching.any? { |c| c["imageDigest"].to_s.empty? } }.map(&:first)
       unless missing.empty?
         fail! "container #{@container} reports no imageDigest on running task(s) #{missing.join(', ')} of #{@cluster}/#{@service}"
       end
 
-      containers.values.flatten.map { |c| c["imageDigest"] }.uniq.sort
+      pairs.flat_map { |_arn, matching| matching.map { |c| c["imageDigest"] } }.uniq.sort
     end
   end
 
