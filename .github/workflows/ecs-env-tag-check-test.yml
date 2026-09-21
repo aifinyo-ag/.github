@@ -1,0 +1,27 @@
+name: ecs-env-tag-check tests
+
+on:
+  pull_request:
+    paths:
+      - actions/ecs-env-tag-check/**
+      - .github/workflows/ecs-env-tag-check-test.yml
+  push:
+    branches: [main]
+    paths:
+      - actions/ecs-env-tag-check/**
+      - .github/workflows/ecs-env-tag-check-test.yml
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Run ecs-env-tag-check tests
+        run: ruby actions/ecs-env-tag-check/test/ecs_env_tag_check_test.rb
